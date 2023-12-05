@@ -5,8 +5,8 @@ This guide details how to deploy the [eShopLite .NET Aspire application](https:/
 1. Publish the .NET Aspire projects to containers on Azure Container Registry
 1. Deploy the apps to an Azure Container Apps environment
 1. View application console logs to troubleshoot application issues
-1. Create a PostgreSQL server in the Azure Container Apps environment & configure the app to use it
-1. Create a Redis server in the Azure Container Apps environment & configure the app to use it
+1. Create a Azure PostgreSQL flexible server & configure the app to use it
+1. Create a Azure Redis Cache & configure the app to use it
 1. Deploy application updates when you change code
 
 ## Prerequisites
@@ -64,6 +64,8 @@ This guide details how to deploy the [eShopLite .NET Aspire application](https:/
     ```
     az provider register --namespace Microsoft.App
     az provider register --namespace Microsoft.OperationalInsights
+    az provider register --namespace Microsoft.Cache
+    az provider register --namespace Microsoft.DBForPostgres
     ```
 
 ## Preparation
@@ -80,6 +82,10 @@ This guide details how to deploy the [eShopLite .NET Aspire application](https:/
     IMAGE_PREFIX="${SOLUTION,,}"           # Container image name prefix, e.g. eshoplite
     IDENTITY="${SOLUTION,,}id"             # Azure Managed Identity, e.g. eshopliteid
     ENVIRONMENT="${SOLUTION,,}cae"         # Azure Container Apps Environment name, e.g. eshoplitecae
+    POSTGRES="${SOLUTION,,}postgres"       # Azure Postgresql flexible server, e.g. eshoplitepostgres
+    POSTGRESUSER="${SOLUTION,,}user"       # Azure Postgresql flexible server user name, e.g. eshopliteuser
+    POSTGRESPWD="${SOLUTION,,}PWD&1234"    # Azure Postgresql flexible server password
+    REDIS="${SOLUTION,,}redis"             # Azure Redis Cache server, e.g. eshopliteredis
     ```
 
     *PowerShell*:
@@ -92,6 +98,10 @@ This guide details how to deploy the [eShopLite .NET Aspire application](https:/
     $IMAGE_PREFIX="$($SOLUTION.ToLower())"           # Container image name prefix, e.g. eshoplite
     $IDENTITY="$($SOLUTION.ToLower())id"             # Azure Managed Identity, e.g. eshopliteid
     $ENVIRONMENT="$($SOLUTION.ToLower())cae"         # Azure Container Apps Environment name, e.g. eshoplitecae
+    $POSTGRES="$($SOLUTION.ToLower())postgres"       # Azure Postgresql flexible server, e.g. eshoplitepostgres
+    $POSTGRESUSER="($SOLUTION.ToLower())user"        # Azure Postgresql flexible server user name, e.g. eshopliteuser
+    $POSTGRESPWD="($SOLUTION.ToLower())PWD&1234"     # Azure Postgresql flexible server password
+    $REDIS="$($SOLUTION.ToLower())redis"             # Azure Redis Cache server, e.g. eshopliteredis
     ```
 
 1. Create a Resource Group to put all our application's Azure resources in:
@@ -217,84 +227,39 @@ This guide details how to deploy the [eShopLite .NET Aspire application](https:/
 
     The logs appear to indicate that the app is calling the *catalogservice* and *basketservice* apps but not getting a response. That's because the *catalogservice* needs a connection string because it needs a database, and the *basketservice* needs connection information for Redis!
 
-## Create a PostgreSQL database and configure the *catalogservice* and *catalogdbmanager* to use it
+## Create a Azure PostgreSQL flexible server and configure the *catalogservice* and *catalogdbmanager* to use it
 
-1. Let's create an instance of PostgreSQL in our ACA environment for our app to use and add a [service binding](https://learn.microsoft.com/azure/container-apps/services) to the *catalogservice* and *catalogdbmanager* apps for it. The service binding will cause ACA to automatically inject the required connection details into the bound apps as environment variables:
-
-    ```powershell
-    az containerapp service postgres create --name postgres --environment $ENVIRONMENT --resource-group $RESOURCE_GROUP
-    az containerapp update --name catalogservice --resource-group $RESOURCE_GROUP --bind postgres
-    az containerapp update --name catalogdbmanager --resource-group $RESOURCE_GROUP --bind postgres
-    ```
-
-1. Create a debug app that we can use to retrieve the injected connection string value for the bound PostgreSQL instance (we would use the *catalogservice* app itself but it's crashing on startup due to it not being able to find the database!). We'll bind this app to the PostgreSQL instance we just created with the `--bind` argument. This app can be deleted later once the eShopLite app is fully setup:
+1. Let's create an instance of Azure PostgreSQL flexible serverfor our app to use and add a [service connection](https://aka.ms/scdoc) to the *catalogservice* and *catalogdbmanager* apps for it. The service connection will cause ACA to automatically inject the required connection details into the bound apps as environment variables:
 
     ```powershell
-    az containerapp create --name bindingdebug --image mcr.microsoft.com/k8se/services/postgres:14 --bind postgres --environment $ENVIRONMENT --resource-group $RESOURCE_GROUP --min-replicas 1 --max-replicas 1 --command "/bin/sleep" "infinity"
-    ```
-
- 1. Execute the `env` command inside the *bindingdebug* app and find the `POSTGRES_CONNECTION_STRING` environment variable value. We'll use this value to construct a valid .NET connection string for our *catalogservice* and *catalogdbmanager* apps:
-
-    ```
-    az containerapp exec --name bindingdebug --resource-group $RESOURCE_GROUP
-    INFO: Connecting to the container 'bindingdebug'...
-    Use ctrl + D to exit.
-    INFO: Successfully connected to container: 'bindingdebug'. [ Revision: 'bindingdebug--oc5jnog', Replica: 'bindingdebug--oc5jnog-bc9c7c858-lzghb']
-    # env | grep "^POSTGRES_CONNECTION_STRING"
-    POSTGRES_CONNECTION_STRING=host=postgres database=postgres user=postgres password=AiSf...
-    # exit
+    az postgres flexible-server create -g $RESOURCE_GROUP -n $POSTGRES --admin-user $POSTGRESUSER --admin-password $POSTGRESPWD -y
     ```
 
 1. The *catalogservice* and *catalogdbmanager* apps are using the Aspire component for Entity Framework Core and PostgreSQL, which loads the connection string from the app's configuration with the key `ConnectionStrings__catalogdb`. Update the apps configuration in ACA so that an environment variable with this name contains a valid connection string constructed using the details retrieved in the previous step. Note that .NET expects semi-colon delimited values in the connection string AND 'user' needs to be 'Username', e.g. `Host=postgres;Database=postgres;Username=postgres;Password=AiSf...`:
 
     ```powershell
-    az containerapp update --name catalogservice --resource-group $RESOURCE_GROUP --set-env-vars 'ConnectionStrings__catalogdb="Host=postgres;Database=postgres;Username=postgres;Password=AiSf..."'
-    az containerapp update --name catalogdbmanager --resource-group $RESOURCE_GROUP --set-env-vars 'ConnectionStrings__catalogdb="Host=postgres;Database=postgres;Username=postgres;Password=AiSf..."'
+    az containerapp connection create postgres-flexible -g $RESOURCE_GROUP -n catalogservice --tg $RESOURCE_GROUP --server postgres1030 --database postgres --secret name=$POSTGRESUSER secret=$POSTGRESPWD --container catalogservice --client-type dotnet-internal --connection catalogdb
+    az containerapp connection create postgres-flexible -g $RESOURCE_GROUP -n catalogdbmanager --tg $RESOURCE_GROUP --server postgres1030 --database postgres --secret name=$POSTGRESUSER secret=$POSTGRESPWD --container catalogdbmanager --client-type dotnet-internal --connection catalogdb
     ```
 
 1. Browse to the *frontend* app's URL again and see that items from our catalog are now displayed!
 
 1. Next we'll configure a Redis server for the *basketservice* app.
 
-## Create a Redis server and configure the *basketservice* to use it 
+## Create a Azure Redis Cache and configure the *basketservice* to use it 
 
 eShopLite includes functionality to add items from the product catalog to a shopping basket. The *basketservice* app uses Redis to store user basket details so for this functionality to work we need a Redis server.
 
-1. Let's create a Redis server in our ACA environment for our app to use and add a [service binding](https://learn.microsoft.com/azure/container-apps/services) to the *basketservice* and *bindingdebug* apps for it. Like it did for our PostgreSQL server, binding the Redis server to these apps will cause ACA to automatically inject the connection information as environment variables:
+1. Let's create a Azure Redis Cache for our app to use and add a [service connection](https://aka.ms/scdoc) to the *basketservice* . Like it did for our PostgreSQL server, connect the Azure Redis Cache to these apps will cause ACA to automatically inject the connection information as environment variables:
 
-    ```powershell
-    az containerapp service redis create --name basketredis --environment $ENVIRONMENT --resource-group $RESOURCE_GROUP
-    az containerapp update --name basketservice --resource-group $RESOURCE_GROUP --bind basketredis
-    az containerapp update --name bindingdebug --resource-group $RESOURCE_GROUP --bind basketredis
-    ```
-
-1. To retrieve the connection information for the bound Redis instance, execute the `env` command inside the *bindingdebug* app and find the `BASKETREDIS_REDIS_ENDPOINT` and `BASKETREDIS_REDIS_PASSWORD` environment variable values:
-
-    ```
-    az containerapp exec --name bindingdebug --resource-group $RESOURCE_GROUP
-    INFO: Connecting to the container 'bindingdebug'...
-    Use ctrl + D to exit.
-    INFO: Successfully connected to container: 'bindingdebug'. [ Revision: 'bindingdebug--oc5jnog', Replica: 'bindingdebug--oc5jnog-bc9c7c858-lzghb']
-    # env | grep "^BASKETREDIS_"
-    BASKETREDIS_REDIS_ENDPOINT=basketredis:6379
-    BASKETREDIS_REDIS_PASSWORD=jH7DePUiK5E...
-    BASKETREDIS_REDIS_HOST=basketredis
-    BASKETREDIS_REDIS_PORT=6379
-    # exit
+    ```shell
+    az redis create -g $RESOURCE_GROUP -n $REDIS --sku basic --vm-size C0 -l $LOCATION
     ```
 
 1. The *basketservice* app is using the Aspire component for Redis, which loads the connection information from the app's configuration with the key `ConnectionStrings__basketcache`. Update the app configuration in ACA so that an environment variable with this name contains a valid connection string constructed using the details retrieved in the previous step. Note that .NET expects comma delimited values in the Redis connection string e.g. `basketredis:6379,password=jH7DePUiK5E...`:
 
-    *bash*:
-
-    ```bash
-    az containerapp update --name basketservice --resource-group $RESOURCE_GROUP --set-env-vars 'ConnectionStrings__basketcache="basketredis:6379,password=jH7DePUiK5E..."'
-    ```
-
-    *PowerShell*:
-
-    ```powershell
-    az containerapp update --name basketservice --resource-group $RESOURCE_GROUP --set-env-vars 'ConnectionStrings__basketcache="basketredis:6379,password=jH7DePUiK5E..."'
+    ```shell
+    az containerapp connection create redis -g $RESOURCE_GROUP -n basketservice --tg $RESOURCE_GROUP --server $REDIS --database 0 --container basketservice --client-type dotnet-internal --connection basketcache
     ```
 
 1. Browse to the *frontend* app URL again and note that the basket item count increases as you add items. You can click the basket icon to clear the basket to zero items.
